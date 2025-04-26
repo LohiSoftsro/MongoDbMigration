@@ -1,14 +1,15 @@
 # MongoDB Migration Tool
 
-A simple Node.js tool for migrating data between MongoDB databases.
+A modern web-based tool for migrating data between MongoDB databases.
 
 ## Features
 
 - Migrate all collections and documents from one MongoDB database to another
-- Interactive command-line interface
-- Progress indication with detailed statistics
+- Clean, modern web interface
+- Real-time progress tracking with detailed statistics
+- Collection-by-collection migration status
 - Validation of connection strings
-- Support for environment variables
+- Support for multiple consecutive migrations
 
 ## Installation
 
@@ -30,21 +31,15 @@ npm install
 npm start
 ```
 
-The tool will prompt you for:
-1. Source MongoDB connection string (including database name)
-2. Target MongoDB connection string (including database name)
-3. Confirmation before starting the migration
+After starting the server:
 
-### Using Environment Variables
-
-You can also set the connection strings using environment variables:
-
-1. Create a `.env` file in the project root
-2. Add the following variables:
-   ```
-   SOURCE_URI=mongodb://username:password@hostname:port/source_database
-   TARGET_URI=mongodb://username:password@hostname:port/target_database
-   ```
+1. Open your browser and navigate to `http://localhost:3000`
+2. Enter the source MongoDB connection string (including database name)
+3. Enter the target MongoDB connection string (including database name)
+4. Click "Start Migration" to begin the process
+5. Monitor the real-time progress of each collection being migrated
+6. View the summary when migration completes
+7. Start a new migration if needed
 
 ## Migration Process
 
@@ -58,7 +53,23 @@ The tool performs the following steps:
    - If the target collection exists and has documents, it drops it first
    - Inserts all documents into the target collection
    - Verifies the document count in the target collection
-4. Displays detailed migration results
+4. Displays detailed migration results with real-time progress tracking
+5. Shows a summary of the migration with statistics
+
+## User Interface
+
+The web interface provides:
+
+1. **Connection Form** - For entering source and target MongoDB connection strings
+2. **Progress Tracking** - Real-time updates showing:
+   - Overall migration progress
+   - Individual collection migration status
+   - Status indicators for each step of the process
+3. **Summary View** - After migration completes:
+   - Total collections migrated
+   - Successful and failed collections
+   - Total documents migrated
+   - Option to start a new migration
 
 ## License
 
