@@ -14,7 +14,7 @@ A simple Node.js tool for migrating data between MongoDB databases.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/mongodb-migration-tool.git
+git clone https://github.com/LohiSoftsro/MongoDbMigration.git
 
 # Navigate to the project directory
 cd mongodb-migration-tool
