@@ -562,10 +562,12 @@
                 
                 if (data.source) {
                     sourceStatusIcon.innerHTML = '<i class="bi bi-check-circle-fill text-success"></i>';
-                    sourceDetails.textContent = `Connected to ${data.sourceDetails.dbName} (${data.sourceDetails.collections} collections)`;
+                    sourceDetails.innerHTML = `Connected to <strong>${data.sourceDetails.dbName}</strong> (${data.sourceDetails.collections} collections)`;
                 } else {
                     sourceStatusIcon.innerHTML = '<i class="bi bi-x-circle-fill text-danger"></i>';
-                    sourceDetails.textContent = 'Connection failed';
+                    sourceDetails.innerHTML = data.errors && data.errors.source ? 
+                        `<span class="text-danger">${data.errors.source}</span>` : 
+                        '<span class="text-danger">Connection failed</span>';
                 }
                 
                 // Update target status
@@ -573,18 +575,41 @@
                 const targetDetails = document.getElementById('target-details');
                 
                 if (data.target) {
+                    const permissions = data.targetDetails.permissions;
+                    const permissionsList = [];
+                    
+                    if (permissions) {
+                        if (permissions.read) permissionsList.push('read');
+                        if (permissions.write) permissionsList.push('write');
+                        if (permissions.update) permissionsList.push('update');
+                        if (permissions.delete) permissionsList.push('delete');
+                    }
+                    
                     targetStatusIcon.innerHTML = '<i class="bi bi-check-circle-fill text-success"></i>';
-                    targetDetails.textContent = `Connected to ${data.targetDetails.dbName} with read/write/update/delete permissions`;
+                    targetDetails.innerHTML = `Connected to <strong>${data.targetDetails.dbName}</strong> with ${permissionsList.join('/')} permissions`;
                 } else {
                     targetStatusIcon.innerHTML = '<i class="bi bi-x-circle-fill text-danger"></i>';
-                    targetDetails.textContent = 'Connection failed';
+                    targetDetails.innerHTML = data.errors && data.errors.target ? 
+                        `<span class="text-danger">${data.errors.target}</span>` : 
+                        '<span class="text-danger">Connection failed</span>';
                 }
                 
-                // Show error if any
+                // Show combined errors if any
                 const testError = document.getElementById('test-error');
-                if (data.error) {
-                    testError.textContent = data.error;
-                    testError.style.display = 'block';
+                if (data.errors && (data.errors.source || data.errors.target)) {
+                    let errorMsg = '';
+                    if (data.errors.source && data.errors.target) {
+                        errorMsg = 'Both source and target connections have issues. Please check the connection strings and ensure MongoDB servers are running.';
+                    } else if (!data.source && !data.target) {
+                        errorMsg = 'Connection test failed for both databases. Please check your connection strings and ensure MongoDB servers are running.';
+                    }
+                    
+                    if (errorMsg) {
+                        testError.textContent = errorMsg;
+                        testError.style.display = 'block';
+                    } else {
+                        testError.style.display = 'none';
+                    }
                 } else {
                     testError.style.display = 'none';
                 }

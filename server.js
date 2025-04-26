@@ -33,35 +33,65 @@ app.get('/', (req, res) => {
 
 // Socket.io connection
 io.on('connection', (socket) => {
-  console.log('A client connected');
   
   // Handle connection test request
   socket.on('testConnections', async (data) => {
     const { sourceUri, targetUri } = data;
+    let sourceValid = false;
+    let targetValid = false;
     
-    try {
-      // Validate connection strings
-      if (!validateConnectionString(sourceUri)) {
-        return socket.emit('testResult', { success: false, source: false, target: false, error: 'Invalid source connection string' });
-      }
-      
-      if (!validateConnectionString(targetUri)) {
-        return socket.emit('testResult', { success: false, source: false, target: false, error: 'Invalid target connection string' });
-      }
-      
-      // Test connections
-      const testResult = await testConnections(sourceUri, targetUri, socket);
-      socket.emit('testResult', testResult);
-      
-    } catch (error) {
-      console.error('Connection test error:', error);
-      socket.emit('testResult', { 
-        success: false, 
-        source: false, 
-        target: false, 
-        error: `Connection test failed: ${error.message}` 
-      });
+    // Initialize result object
+    const result = {
+      success: false,
+      source: false,
+      target: false,
+      sourceDetails: {},
+      targetDetails: {},
+      errors: {}
+    };
+    
+    // Validate connection strings
+    if (!validateConnectionString(sourceUri)) {
+      result.errors.source = 'Invalid source connection string format';
     }
+    
+    if (!validateConnectionString(targetUri)) {
+      result.errors.target = 'Invalid target connection string format';
+    }
+    
+    // Test source connection if valid format
+    if (!result.errors.source) {
+      try {
+        socket.emit('status', { message: 'Testing source connection...', progress: 10 });
+        const sourceResult = await testSourceConnection(sourceUri);
+        result.source = true;
+        result.sourceDetails = sourceResult;
+        socket.emit('status', { message: 'Source connection successful', progress: 40 });
+      } catch (error) {
+        result.errors.source = `Source connection failed: ${error.message}`;
+        socket.emit('status', { message: `Source connection failed: ${error.message}`, progress: 40 });
+      }
+    }
+    
+    // Test target connection if valid format (regardless of source result)
+    if (!result.errors.target) {
+      try {
+        socket.emit('status', { message: 'Testing target connection...', progress: 60 });
+        const targetResult = await testTargetConnection(targetUri);
+        result.target = true;
+        result.targetDetails = targetResult;
+        socket.emit('status', { message: 'Target connection successful', progress: 100 });
+      } catch (error) {
+        result.errors.target = `Target connection failed: ${error.message}`;
+        socket.emit('status', { message: `Target connection failed: ${error.message}`, progress: 100 });
+      }
+    }
+    
+    // Set overall success if both connections were successful
+    result.success = result.source && result.target;
+    
+    // Send the test results
+    socket.emit('testResult', result);
   });
   
   // Handle migration request
@@ -82,13 +112,12 @@ io.on('connection', (socket) => {
       await migrateDatabase(sourceUri, targetUri, socket, migrationMode);
       
     } catch (error) {
-      console.error('Migration error:', error);
       socket.emit('error', `Migration failed: ${error.message}`);
     }
   });
   
   socket.on('disconnect', () => {
-    console.log('Client disconnected');
+    // Client disconnected
   });
 });
 
@@ -98,7 +127,9 @@ io.on('connection', (socket) => {
  * @returns {boolean} - True if valid, false if invalid
  */
 function validateConnectionString(uri) {
-  if (!uri) return false;
+  if (!uri) {
+    return false;
+  }
   
   try {
     // Check if it's a valid MongoDB URI format
@@ -106,8 +137,16 @@ function validateConnectionString(uri) {
       return false;
     }
     
+    // Parse the URI to check its components
+    const uriWithoutProtocol = uri.replace(/^mongodb(\+srv)?:\/\//, '');
+    
+    // Check if there's a slash to indicate database name
+    if (!uriWithoutProtocol.includes('/')) {
+      return false;
+    }
+    
     // Check if database name is included
-    const dbNameCheck = uri.split('/').pop().split('?')[0];
+    const dbNameCheck = getDatabaseName(uri);
     if (!dbNameCheck) {
       return false;
     }
@@ -125,9 +164,23 @@ function validateConnectionString(uri) {
  */
 function getDatabaseName(uri) {
   try {
-    return uri.split('/').pop().split('?')[0];
+    // Handle standard MongoDB URI format
+    if (uri.includes('mongodb://') || uri.includes('mongodb+srv://')) {
+      // Extract the part after the last slash and before any query parameters
+      const dbPart = uri.split('/').pop().split('?')[0];
+      
+      // If there's no database specified, return empty string
+      if (!dbPart || dbPart === '') {
+        return '';
+      }
+      
+      return dbPart;
+    } 
+    // Handle direct database name (for backward compatibility)
+    else {
+      return uri;
+    }
   } catch (error) {
-    console.error('Error extracting database name:', error);
     return '';
   }
 }
@@ -139,13 +192,43 @@ function getDatabaseName(uri) {
  */
 async function connectToDatabase(uri) {
   try {
-    const client = new MongoClient(uri);
+    
+    // Check if the URI is valid
+    if (!uri) {
+      throw new Error('Connection string is empty');
+    }
+    
+    // Create MongoDB client with more options for better error handling
+    const client = new MongoClient(uri, {
+      serverSelectionTimeoutMS: 5000, // 5 seconds timeout for server selection
+      connectTimeoutMS: 10000, // 10 seconds timeout for initial connection
+      socketTimeoutMS: 45000, // 45 seconds timeout for socket operations
+    });
+    
+    // Connect to the MongoDB server
     await client.connect();
+    
+    // Get database name from URI or use default
     const dbName = getDatabaseName(uri);
+    if (!dbName) {
+      throw new Error('No database name specified in the connection string');
+    }
+    
+    // Get database instance
     const db = client.db(dbName);
+    
+    // Test the connection by running a simple command
+    await db.command({ ping: 1 });
+    
     return { client, db, dbName };
   } catch (error) {
-    throw new Error(`Failed to connect to database: ${error.message}`);
+    if (error.name === 'MongoServerSelectionError') {
+      throw new Error(`Could not connect to MongoDB server. Please check if the server is running and the connection string is correct. Details: ${error.message}`);
+    } else if (error.name === 'MongoParseError') {
+      throw new Error(`Invalid MongoDB connection string format. Details: ${error.message}`);
+    } else {
+      throw new Error(`Failed to connect to database: ${error.message}`);
+    }
   }
 }
 
@@ -164,38 +247,53 @@ async function getCollections(db) {
 }
 
 /**
- * Test database connections
+ * Test source database connection (read-only)
  * @param {string} sourceUri - Source MongoDB connection string
- * @param {string} targetUri - Target MongoDB connection string
- * @param {Object} socket - Socket.io socket for updates
  * @returns {Promise<Object>} - Test results
  */
-async function testConnections(sourceUri, targetUri, socket) {
-  let sourceClient, targetClient;
-  const result = {
-    success: false,
-    source: false,
-    target: false,
-    sourceDetails: {},
-    targetDetails: {}
-  };
+async function testSourceConnection(sourceUri) {
+  let sourceClient;
   
   try {
-    // Test source connection (read-only)
-    socket.emit('status', { message: 'Testing source connection...', progress: 10 });
+    // Connect to source database
     const source = await connectToDatabase(sourceUri);
     sourceClient = source.client;
     const sourceDb = source.db;
     
     // Test read operation
     const collections = await sourceDb.listCollections().toArray();
-    result.source = true;
-    result.sourceDetails.dbName = source.dbName;
-    result.sourceDetails.collections = collections.length;
-    socket.emit('status', { message: 'Source connection successful', progress: 30 });
     
-    // Test target connection (read, write, update, delete)
-    socket.emit('status', { message: 'Testing target connection...', progress: 40 });
+    // Return source details
+    return {
+      dbName: source.dbName,
+      collections: collections.length,
+      readPermission: true
+    };
+    
+  } catch (error) {
+    throw error;
+  } finally {
+    // Close database connection
+    if (sourceClient) await sourceClient.close();
+  }
+}
+
+/**
+ * Test target database connection (read, write, update, delete)
+ * @param {string} targetUri - Target MongoDB connection string
+ * @returns {Promise<Object>} - Test results
+ */
+async function testTargetConnection(targetUri) {
+  let targetClient;
+  const permissions = {
+    read: false,
+    write: false,
+    update: false,
+    delete: false
+  };
+  
+  try {
+    // Connect to target database
     const target = await connectToDatabase(targetUri);
     targetClient = target.client;
     const targetDb = target.db;
@@ -203,41 +301,41 @@ async function testConnections(sourceUri, targetUri, socket) {
     // Test collection creation and document operations
     const testCollection = targetDb.collection('migration_test_collection');
     
-    // Test write
-    socket.emit('status', { message: 'Testing write permission on target...', progress: 50 });
+    // Test write permission
     const writeResult = await testCollection.insertOne({ test: true, timestamp: new Date() });
+    permissions.write = true;
     
-    // Test read
-    socket.emit('status', { message: 'Testing read permission on target...', progress: 60 });
+    // Test read permission
     const readResult = await testCollection.findOne({ _id: writeResult.insertedId });
+    permissions.read = !!readResult;
     
-    // Test update
-    socket.emit('status', { message: 'Testing update permission on target...', progress: 70 });
-    await testCollection.updateOne({ _id: writeResult.insertedId }, { $set: { updated: true } });
+    // Test update permission
+    const updateResult = await testCollection.updateOne(
+      { _id: writeResult.insertedId }, 
+      { $set: { updated: true } }
+    );
+    permissions.update = updateResult.modifiedCount === 1;
     
-    // Test delete
-    socket.emit('status', { message: 'Testing delete permission on target...', progress: 80 });
-    await testCollection.deleteOne({ _id: writeResult.insertedId });
+    // Test delete permission
+    const deleteResult = await testCollection.deleteOne({ _id: writeResult.insertedId });
+    permissions.delete = deleteResult.deletedCount === 1;
     
     // Clean up test collection
-    socket.emit('status', { message: 'Cleaning up test collection...', progress: 90 });
     await testCollection.drop().catch(() => {}); // Ignore error if collection doesn't exist
     
-    result.target = true;
-    result.targetDetails.dbName = target.dbName;
-    socket.emit('status', { message: 'Target connection successful', progress: 100 });
-    
-    result.success = true;
-    return result;
+    // Return target details
+    return {
+      dbName: target.dbName,
+      permissions: permissions,
+      allPermissionsGranted: Object.values(permissions).every(p => p === true)
+    };
     
   } catch (error) {
-    console.error('Connection test error:', error);
-    result.error = error.message;
-    socket.emit('status', { message: `Connection test failed: ${error.message}`, progress: 100 });
-    return result;
+    // Add permissions info to the error for better diagnostics
+    error.permissions = permissions;
+    throw error;
   } finally {
-    // Close database connections
-    if (sourceClient) await sourceClient.close();
+    // Close database connection
     if (targetClient) await targetClient.close();
   }
 }
@@ -598,16 +696,16 @@ function startServer(port) {
   server.listen(port)
     .on('error', (err) => {
       if (err.code === 'EADDRINUSE') {
-        console.log(chalk.yellow(`Port ${port} is already in use, trying ${port + 1}...`));
+        console.log(`Port ${port} is already in use, trying ${port + 1}...`);
         startServer(port + 1);
       } else {
-        console.error(chalk.red(`Server error: ${err.message}`));
+        console.error(`Server error: ${err.message}`);
       }
     })
     .on('listening', () => {
       const actualPort = server.address().port;
-      console.log(chalk.bold.green(`MongoDB Migration Tool server running on port ${actualPort}`));
-      console.log(chalk.cyan(`Open http://localhost:${actualPort} in your browser to start`));
+      console.log(`MongoDB Migration Tool server running on port ${actualPort}`);
+      console.log(`Open http://localhost:${actualPort} in your browser to start`);
     });
 }
 
