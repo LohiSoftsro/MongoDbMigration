@@ -35,9 +35,38 @@ app.get('/', (req, res) => {
 io.on('connection', (socket) => {
   console.log('A client connected');
   
+  // Handle connection test request
+  socket.on('testConnections', async (data) => {
+    const { sourceUri, targetUri } = data;
+    
+    try {
+      // Validate connection strings
+      if (!validateConnectionString(sourceUri)) {
+        return socket.emit('testResult', { success: false, source: false, target: false, error: 'Invalid source connection string' });
+      }
+      
+      if (!validateConnectionString(targetUri)) {
+        return socket.emit('testResult', { success: false, source: false, target: false, error: 'Invalid target connection string' });
+      }
+      
+      // Test connections
+      const testResult = await testConnections(sourceUri, targetUri, socket);
+      socket.emit('testResult', testResult);
+      
+    } catch (error) {
+      console.error('Connection test error:', error);
+      socket.emit('testResult', { 
+        success: false, 
+        source: false, 
+        target: false, 
+        error: `Connection test failed: ${error.message}` 
+      });
+    }
+  });
+  
   // Handle migration request
   socket.on('startMigration', async (data) => {
-    const { sourceUri, targetUri } = data;
+    const { sourceUri, targetUri, migrationMode } = data;
     
     try {
       // Validate connection strings
@@ -49,8 +78,8 @@ io.on('connection', (socket) => {
         return socket.emit('error', 'Invalid target connection string');
       }
       
-      // Start migration
-      await migrateDatabase(sourceUri, targetUri, socket);
+      // Start migration with the selected mode
+      await migrateDatabase(sourceUri, targetUri, socket, migrationMode);
       
     } catch (error) {
       console.error('Migration error:', error);
@@ -135,6 +164,85 @@ async function getCollections(db) {
 }
 
 /**
+ * Test database connections
+ * @param {string} sourceUri - Source MongoDB connection string
+ * @param {string} targetUri - Target MongoDB connection string
+ * @param {Object} socket - Socket.io socket for updates
+ * @returns {Promise<Object>} - Test results
+ */
+async function testConnections(sourceUri, targetUri, socket) {
+  let sourceClient, targetClient;
+  const result = {
+    success: false,
+    source: false,
+    target: false,
+    sourceDetails: {},
+    targetDetails: {}
+  };
+  
+  try {
+    // Test source connection (read-only)
+    socket.emit('status', { message: 'Testing source connection...', progress: 10 });
+    const source = await connectToDatabase(sourceUri);
+    sourceClient = source.client;
+    const sourceDb = source.db;
+    
+    // Test read operation
+    const collections = await sourceDb.listCollections().toArray();
+    result.source = true;
+    result.sourceDetails.dbName = source.dbName;
+    result.sourceDetails.collections = collections.length;
+    socket.emit('status', { message: 'Source connection successful', progress: 30 });
+    
+    // Test target connection (read, write, update, delete)
+    socket.emit('status', { message: 'Testing target connection...', progress: 40 });
+    const target = await connectToDatabase(targetUri);
+    targetClient = target.client;
+    const targetDb = target.db;
+    
+    // Test collection creation and document operations
+    const testCollection = targetDb.collection('migration_test_collection');
+    
+    // Test write
+    socket.emit('status', { message: 'Testing write permission on target...', progress: 50 });
+    const writeResult = await testCollection.insertOne({ test: true, timestamp: new Date() });
+    
+    // Test read
+    socket.emit('status', { message: 'Testing read permission on target...', progress: 60 });
+    const readResult = await testCollection.findOne({ _id: writeResult.insertedId });
+    
+    // Test update
+    socket.emit('status', { message: 'Testing update permission on target...', progress: 70 });
+    await testCollection.updateOne({ _id: writeResult.insertedId }, { $set: { updated: true } });
+    
+    // Test delete
+    socket.emit('status', { message: 'Testing delete permission on target...', progress: 80 });
+    await testCollection.deleteOne({ _id: writeResult.insertedId });
+    
+    // Clean up test collection
+    socket.emit('status', { message: 'Cleaning up test collection...', progress: 90 });
+    await testCollection.drop().catch(() => {}); // Ignore error if collection doesn't exist
+    
+    result.target = true;
+    result.targetDetails.dbName = target.dbName;
+    socket.emit('status', { message: 'Target connection successful', progress: 100 });
+    
+    result.success = true;
+    return result;
+    
+  } catch (error) {
+    console.error('Connection test error:', error);
+    result.error = error.message;
+    socket.emit('status', { message: `Connection test failed: ${error.message}`, progress: 100 });
+    return result;
+  } finally {
+    // Close database connections
+    if (sourceClient) await sourceClient.close();
+    if (targetClient) await targetClient.close();
+  }
+}
+
+/**
  * Migrate a single collection from source to target
  * @param {Object} sourceDb - Source database instance
  * @param {Object} targetDb - Target database instance
@@ -142,9 +250,10 @@ async function getCollections(db) {
  * @param {Object} socket - Socket.io socket for progress updates
  * @param {number} index - Current collection index
  * @param {number} total - Total number of collections
+ * @param {string} migrationMode - Migration mode ('complete' or 'newOnly')
  * @returns {Promise<Object>} - Migration statistics
  */
-async function migrateCollection(sourceDb, targetDb, collectionName, socket, index, total) {
+async function migrateCollection(sourceDb, targetDb, collectionName, socket, index, total, migrationMode) {
   try {
     const sourceCollection = sourceDb.collection(collectionName);
     const targetCollection = targetDb.collection(collectionName);
@@ -160,17 +269,14 @@ async function migrateCollection(sourceDb, targetDb, collectionName, socket, ind
       progress: 0
     });
     
-    // Get all documents from source collection
-    const documents = await sourceCollection.find({}).toArray();
-    
-    // If there are documents to migrate
-    if (documents.length > 0) {
-      // Check if target collection already exists and has documents
+    // Different behavior based on migration mode
+    if (migrationMode === 'complete') {
+      // Complete migration - drop target collection if it exists
       const targetExists = await targetDb.listCollections({ name: collectionName }).hasNext();
       if (targetExists) {
         const targetCount = await targetCollection.countDocuments();
         if (targetCount > 0) {
-          // Drop the target collection to avoid duplicates
+          // Drop the target collection
           await targetCollection.drop();
           socket.emit('collectionProgress', {
             collection: collectionName,
@@ -183,56 +289,153 @@ async function migrateCollection(sourceDb, targetDb, collectionName, socket, ind
         }
       }
       
-      // Update progress
+      // Get all documents from source collection
+      const documents = await sourceCollection.find({}).toArray();
+      
+      if (documents.length > 0) {
+        // Update progress
+        socket.emit('collectionProgress', {
+          collection: collectionName,
+          status: 'copying',
+          message: `Copying ${documents.length} documents...`,
+          current: index,
+          total: total,
+          progress: 50
+        });
+        
+        // Insert all documents to target collection
+        await targetCollection.insertMany(documents);
+        
+        // Verify the document count in target collection
+        const newCount = await targetCollection.countDocuments();
+        
+        // Update progress
+        socket.emit('collectionProgress', {
+          collection: collectionName,
+          status: 'completed',
+          message: `Completed: ${newCount}/${documents.length} documents migrated`,
+          current: index,
+          total: total,
+          progress: 100
+        });
+        
+        return {
+          collection: collectionName,
+          documentCount: documents.length,
+          migratedCount: newCount,
+          success: documents.length === newCount,
+          mode: 'complete'
+        };
+      } else {
+        // Empty collection
+        socket.emit('collectionProgress', {
+          collection: collectionName,
+          status: 'completed',
+          message: 'No documents to migrate',
+          current: index,
+          total: total,
+          progress: 100
+        });
+        
+        return {
+          collection: collectionName,
+          documentCount: 0,
+          migratedCount: 0,
+          success: true,
+          message: 'No documents to migrate',
+          mode: 'complete'
+        };
+      }
+    } else if (migrationMode === 'newOnly') {
+      // New documents only - get existing IDs from target
       socket.emit('collectionProgress', {
         collection: collectionName,
-        status: 'copying',
-        message: `Copying ${count} documents...`,
+        status: 'preparing',
+        message: `Checking for new documents in ${collectionName}...`,
         current: index,
         total: total,
-        progress: 50
+        progress: 20
       });
       
-      // Insert all documents to target collection
-      await targetCollection.insertMany(documents);
+      // Get all document IDs from target collection
+      const existingIds = new Set();
+      const targetExists = await targetDb.listCollections({ name: collectionName }).hasNext();
       
-      // Verify the document count in target collection
-      const newCount = await targetCollection.countDocuments();
+      if (targetExists) {
+        const existingIdObjects = await targetCollection.find({}, { projection: { _id: 1 } }).toArray();
+        existingIdObjects.forEach(doc => existingIds.add(doc._id.toString()));
+      }
       
-      // Update progress
+      // Get all documents from source collection
+      const allSourceDocs = await sourceCollection.find({}).toArray();
+      
+      // Filter out documents that already exist in target
+      const newDocuments = allSourceDocs.filter(doc => !existingIds.has(doc._id.toString()));
+      
       socket.emit('collectionProgress', {
         collection: collectionName,
-        status: 'completed',
-        message: `Completed: ${newCount}/${count} documents migrated`,
+        status: 'preparing',
+        message: `Found ${newDocuments.length} new documents out of ${allSourceDocs.length} total`,
         current: index,
         total: total,
-        progress: 100
+        progress: 40
       });
       
-      return {
-        collection: collectionName,
-        documentCount: count,
-        migratedCount: newCount,
-        success: count === newCount
-      };
+      if (newDocuments.length > 0) {
+        // Update progress
+        socket.emit('collectionProgress', {
+          collection: collectionName,
+          status: 'copying',
+          message: `Copying ${newDocuments.length} new documents...`,
+          current: index,
+          total: total,
+          progress: 60
+        });
+        
+        // Insert new documents to target collection
+        await targetCollection.insertMany(newDocuments);
+        
+        // Update progress
+        socket.emit('collectionProgress', {
+          collection: collectionName,
+          status: 'completed',
+          message: `Completed: ${newDocuments.length} new documents migrated`,
+          current: index,
+          total: total,
+          progress: 100
+        });
+        
+        return {
+          collection: collectionName,
+          totalDocuments: allSourceDocs.length,
+          newDocuments: newDocuments.length,
+          migratedCount: newDocuments.length,
+          success: true,
+          mode: 'newOnly'
+        };
+      } else {
+        // No new documents
+        socket.emit('collectionProgress', {
+          collection: collectionName,
+          status: 'completed',
+          message: 'No new documents to migrate',
+          current: index,
+          total: total,
+          progress: 100
+        });
+        
+        return {
+          collection: collectionName,
+          totalDocuments: allSourceDocs.length,
+          newDocuments: 0,
+          migratedCount: 0,
+          success: true,
+          message: 'No new documents to migrate',
+          mode: 'newOnly'
+        };
+      }
     } else {
-      // Update progress for empty collection
-      socket.emit('collectionProgress', {
-        collection: collectionName,
-        status: 'completed',
-        message: 'No documents to migrate',
-        current: index,
-        total: total,
-        progress: 100
-      });
-      
-      return {
-        collection: collectionName,
-        documentCount: 0,
-        migratedCount: 0,
-        success: true,
-        message: 'No documents to migrate'
-      };
+      throw new Error(`Invalid migration mode: ${migrationMode}`);
     }
   } catch (error) {
     // Update progress for failed collection
@@ -258,11 +461,17 @@ async function migrateCollection(sourceDb, targetDb, collectionName, socket, ind
  * @param {string} sourceUri - Source MongoDB connection string
  * @param {string} targetUri - Target MongoDB connection string
  * @param {Object} socket - Socket.io socket for progress updates
+ * @param {string} migrationMode - Migration mode ('complete' or 'newOnly')
  */
-async function migrateDatabase(sourceUri, targetUri, socket) {
+async function migrateDatabase(sourceUri, targetUri, socket, migrationMode = 'complete') {
   let sourceClient, targetClient;
   
   try {
+    // Validate migration mode
+    if (migrationMode !== 'complete' && migrationMode !== 'newOnly') {
+      throw new Error(`Invalid migration mode: ${migrationMode}`);
+    }
+    
     // Connect to source database
     socket.emit('status', { message: 'Connecting to source database...', progress: 5 });
     const source = await connectToDatabase(sourceUri);
@@ -282,13 +491,24 @@ async function migrateDatabase(sourceUri, targetUri, socket) {
       progress: 15
     });
     
+    // Display migration mode
+    const modeMessage = migrationMode === 'complete' 
+      ? 'Migration mode: Complete (drop existing collections)' 
+      : 'Migration mode: New documents only (preserve existing documents)';
+    
+    socket.emit('status', { message: modeMessage, progress: 18 });
+    
     // Get all collections from source database
     socket.emit('status', { message: 'Getting collections from source database...', progress: 20 });
     const collections = await getCollections(sourceDb);
     
     if (collections.length === 0) {
       socket.emit('status', { message: 'No collections found in source database', progress: 100 });
-      socket.emit('completed', { success: true, message: 'No collections to migrate' });
+      socket.emit('completed', { 
+        success: true, 
+        message: 'No collections to migrate',
+        migrationMode: migrationMode
+      });
       return;
     }
     
@@ -307,7 +527,8 @@ async function migrateDatabase(sourceUri, targetUri, socket) {
         collectionName, 
         socket,
         i + 1,
-        collections.length
+        collections.length,
+        migrationMode
       );
       results.push(result);
       
@@ -319,16 +540,23 @@ async function migrateDatabase(sourceUri, targetUri, socket) {
       });
     }
     
-    // Calculate summary
+    // Calculate summary based on migration mode
     let totalDocuments = 0;
     let totalMigrated = 0;
+    let newDocuments = 0;
     let successCount = 0;
     let failCount = 0;
     
     results.forEach(result => {
       if (result.success) {
-        totalDocuments += result.documentCount || 0;
-        totalMigrated += result.migratedCount || 0;
+        if (migrationMode === 'complete') {
+          totalDocuments += result.documentCount || 0;
+          totalMigrated += result.migratedCount || 0;
+        } else { // newOnly mode
+          totalDocuments += result.totalDocuments || 0;
+          newDocuments += result.newDocuments || 0;
+          totalMigrated += result.migratedCount || 0;
+        }
         successCount++;
       } else {
         failCount++;
@@ -338,17 +566,23 @@ async function migrateDatabase(sourceUri, targetUri, socket) {
     // Send completion event
     socket.emit('completed', {
       success: true,
+      migrationMode: migrationMode,
       totalCollections: collections.length,
       successfulCollections: successCount,
       failedCollections: failCount,
       totalDocuments: totalDocuments,
+      newDocuments: migrationMode === 'newOnly' ? newDocuments : undefined,
       migratedDocuments: totalMigrated
     });
     
   } catch (error) {
     console.error('Migration error:', error);
     socket.emit('status', { message: `Migration failed: ${error.message}`, progress: 100 });
-    socket.emit('completed', { success: false, error: error.message });
+    socket.emit('completed', { 
+      success: false, 
+      error: error.message,
+      migrationMode: migrationMode 
+    });
   } finally {
     // Close database connections
     if (sourceClient) await sourceClient.close();

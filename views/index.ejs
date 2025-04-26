@@ -134,8 +134,57 @@
                                 <input type="text" class="form-control" id="targetUri" placeholder="mongodb://username:password@hostname:port/target_database" required>
                                 <div class="form-text">Include the database name in the connection string</div>
                             </div>
+                            <div class="mb-3">
+                                <button type="button" id="test-connections-btn" class="btn btn-secondary w-100">Test Connections</button>
+                            </div>
+                            
+                            <div id="test-results" class="mb-3" style="display: none;">
+                                <div class="card">
+                                    <div class="card-header bg-light">
+                                        <h6 class="mb-0">Connection Test Results</h6>
+                                    </div>
+                                    <div class="card-body">
+                                        <div class="row">
+                                            <div class="col-md-6">
+                                                <div class="d-flex align-items-center mb-2">
+                                                    <span id="source-status-icon" class="me-2"></span>
+                                                    <strong>Source Database</strong>
+                                                </div>
+                                                <p id="source-details" class="small text-muted"></p>
+                                            </div>
+                                            <div class="col-md-6">
+                                                <div class="d-flex align-items-center mb-2">
+                                                    <span id="target-status-icon" class="me-2"></span>
+                                                    <strong>Target Database</strong>
+                                                </div>
+                                                <p id="target-details" class="small text-muted"></p>
+                                            </div>
+                                        </div>
+                                        <div id="test-error" class="alert alert-danger mt-2" style="display: none;"></div>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Migration Mode</label>
+                                <div class="form-check">
+                                    <input class="form-check-input" type="radio" name="migrationMode" id="mode-complete" value="complete" checked>
+                                    <label class="form-check-label" for="mode-complete">
+                                        Complete Migration (Drop Existing Collections)
+                                        <small class="d-block text-muted">Deletes all existing data in target collections and performs a full migration</small>
+                                    </label>
+                                </div>
+                                <div class="form-check mt-2">
+                                    <input class="form-check-input" type="radio" name="migrationMode" id="mode-newOnly" value="newOnly">
+                                    <label class="form-check-label" for="mode-newOnly">
+                                        New Documents Only
+                                        <small class="d-block text-muted">Preserves existing documents and only adds documents that don't exist in the target (based on _id)</small>
+                                    </label>
+                                </div>
+                            </div>
+                            
                             <div class="d-grid gap-2">
-                                <button type="submit" class="btn btn-primary">Start Migration</button>
+                                <button type="submit" id="start-migration-btn" class="btn btn-primary" disabled>Start Migration</button>
                             </div>
                         </form>
                     </div>
@@ -199,7 +248,12 @@
                             </div>
                             <div class="col-6 col-md-3 mb-3">
                                 <div class="summary-value" id="total-documents">0</div>
-                                <div class="summary-label">Documents Migrated</div>
+                                <div class="summary-label" id="documents-label">Documents Migrated</div>
+                            </div>
+                            <div class="col-12 mt-2" id="total-source-row" style="display: none;">
+                                <div class="alert alert-info">
+                                    <strong id="total-source-documents">0</strong> new documents were migrated out of <strong id="total-source-documents-count">0</strong> total documents in the source database
+                                </div>
                             </div>
                         </div>
                         
@@ -239,12 +293,40 @@
             // Connect to Socket.io
             const socket = io();
             
+            // Test connections button
+            document.getElementById('test-connections-btn').addEventListener('click', function() {
+                const sourceUri = document.getElementById('sourceUri').value;
+                const targetUri = document.getElementById('targetUri').value;
+                
+                if (!sourceUri || !targetUri) {
+                    alert('Please enter both source and target connection strings');
+                    return;
+                }
+                
+                // Show testing status
+                statusMessage.textContent = 'Testing connections...';
+                progressCard.style.display = 'block';
+                connectionForm.style.display = 'none';
+                overallProgress.style.width = '0%';
+                collectionsContainer.innerHTML = '';
+                
+                // Test connections
+                socket.emit('testConnections', { sourceUri, targetUri });
+                
+                // Hide progress card after test is complete
+                setTimeout(() => {
+                    progressCard.style.display = 'none';
+                    connectionForm.style.display = 'block';
+                }, 500);
+            });
+            
             // Form submission
             migrationForm.addEventListener('submit', function(e) {
                 e.preventDefault();
                 
                 const sourceUri = document.getElementById('sourceUri').value;
                 const targetUri = document.getElementById('targetUri').value;
+                const migrationMode = document.querySelector('input[name="migrationMode"]:checked').value;
                 
                 // Show progress card
                 connectionForm.style.display = 'none';
@@ -252,7 +334,7 @@
                 collectionsContainer.innerHTML = '';
                 
                 // Start migration
-                socket.emit('startMigration', { sourceUri, targetUri });
+                socket.emit('startMigration', { sourceUri, targetUri, migrationMode });
             });
             
             // Cancel button
@@ -311,6 +393,46 @@
                 document.getElementById(`collection-${data.collection}-progress-text`).textContent = `${data.progress}%`;
             });
             
+            socket.on('testResult', function(data) {
+                document.getElementById('test-results').style.display = 'block';
+                
+                // Update source status
+                const sourceStatusIcon = document.getElementById('source-status-icon');
+                const sourceDetails = document.getElementById('source-details');
+                
+                if (data.source) {
+                    sourceStatusIcon.innerHTML = '<i class="bi bi-check-circle-fill text-success"></i>';
+                    sourceDetails.textContent = `Connected to ${data.sourceDetails.dbName} (${data.sourceDetails.collections} collections)`;
+                } else {
+                    sourceStatusIcon.innerHTML = '<i class="bi bi-x-circle-fill text-danger"></i>';
+                    sourceDetails.textContent = 'Connection failed';
+                }
+                
+                // Update target status
+                const targetStatusIcon = document.getElementById('target-status-icon');
+                const targetDetails = document.getElementById('target-details');
+                
+                if (data.target) {
+                    targetStatusIcon.innerHTML = '<i class="bi bi-check-circle-fill text-success"></i>';
+                    targetDetails.textContent = `Connected to ${data.targetDetails.dbName} with read/write/update/delete permissions`;
+                } else {
+                    targetStatusIcon.innerHTML = '<i class="bi bi-x-circle-fill text-danger"></i>';
+                    targetDetails.textContent = 'Connection failed';
+                }
+                
+                // Show error if any
+                const testError = document.getElementById('test-error');
+                if (data.error) {
+                    testError.textContent = data.error;
+                    testError.style.display = 'block';
+                } else {
+                    testError.style.display = 'none';
+                }
+                
+                // Enable/disable start migration button
+                document.getElementById('start-migration-btn').disabled = !(data.source && data.target);
+            });
+            
             socket.on('completed', function(data) {
                 // Hide progress card
                 progressCard.style.display = 'none';
@@ -326,6 +448,17 @@
                     totalCollections.textContent = data.totalCollections || 0;
                     successfulCollections.textContent = data.successfulCollections || 0;
                     failedCollections.textContent = data.failedCollections || 0;
+                    
+                    // Show different stats based on migration mode
+                    if (data.migrationMode === 'newOnly') {
+                        document.getElementById('documents-label').textContent = 'New Documents Migrated';
+                        document.getElementById('total-source-documents').textContent = data.totalDocuments || 0;
+                        document.getElementById('total-source-row').style.display = 'block';
+                    } else {
+                        document.getElementById('documents-label').textContent = 'Documents Migrated';
+                        document.getElementById('total-source-row').style.display = 'none';
+                    }
+                    
                     totalDocuments.textContent = data.migratedDocuments || 0;
                 } else {
                     summarySuccess.style.display = 'none';
